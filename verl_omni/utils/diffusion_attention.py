@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FA2/FA3 availability checks and validation for matched actor/rollout attention."""
+"""FA2/FA3/FA4 availability checks and validation for matched actor/rollout attention."""
 
 from __future__ import annotations
 
@@ -32,35 +32,69 @@ ACTOR_BACKENDS = (ACTOR_FA2_BACKEND, ACTOR_FA3_BACKEND, ACTOR_NATIVE_BACKEND, "_
 ROLLOUT_BACKENDS = FA_ROLLOUT_BACKENDS + (ROLLOUT_SDPA_BACKEND,)
 
 
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ValueError):
+        # find_spec imports parent packages for dotted names; a broken parent
+        # (e.g. an ABI-mismatched flash_attn wheel) means the module is unusable.
+        return False
+
+
 def actor_fa_available() -> bool:
-    return importlib.util.find_spec("kernels") is not None
+    return _module_available("kernels")
 
 
-def _cuda_supports_rollout_fa() -> bool:
+def _cuda_capability() -> tuple[int, int] | None:
     try:
         import torch
 
         if not torch.cuda.is_available():
-            return False
+            return None
         major, minor = torch.cuda.get_device_capability()
-        compute_capability = major + minor / 10.0
-        return 8.0 <= compute_capability < 10.0
+        return int(major), int(minor)
     except Exception:
+        return None
+
+
+def _cuda_supports_rollout_fa() -> bool:
+    """Ampere/Hopper: the FA2/FA3 wheels that back ``FLASH_ATTN`` ship kernels for these."""
+    capability = _cuda_capability()
+    if capability is None:
         return False
+    compute_capability = capability[0] + capability[1] / 10.0
+    return 8.0 <= compute_capability < 10.0
+
+
+def rollout_fa4_available() -> bool:
+    """True on Blackwell (sm100/sm110/sm120) when CuTe FlashAttention-4 is importable.
+
+    On compute capability >= 10, vLLM-Omni's ``FLASH_ATTN`` backend prefers
+    ``flash_attn.cute`` (FA4) over Hopper-only FA3 wheels, which would otherwise
+    import fine and then fail at launch with "no kernel image is available".
+    FA4 ships forward and backward kernels for sm120 (RTX PRO Blackwell class).
+    """
+    capability = _cuda_capability()
+    if capability is None or capability[0] < 10:
+        return False
+    return _module_available("flash_attn.cute")
 
 
 def rollout_fa_available() -> bool:
     """True when local FA packages can back ``FLASH_ATTN`` rollout."""
-    if not _cuda_supports_rollout_fa():
-        return False
-    for module_name in ("fa3_fwd_interface", "flash_attn"):
-        if importlib.util.find_spec(module_name) is not None:
-            return True
-    return False
+    if _cuda_supports_rollout_fa():
+        return any(_module_available(name) for name in ("fa3_fwd_interface", "flash_attn"))
+    return rollout_fa4_available()
 
 
 def fa_available() -> bool:
-    return actor_fa_available() and rollout_fa_available()
+    """True when the default FA pair (FA3 kernels-hub Actor + ``FLASH_ATTN`` rollout) runs locally.
+
+    The Actor FA backends load kernels-hub FA2/FA3 builds, and the FA3 build has
+    no Blackwell kernels, so a Blackwell GPU with FA4 rollout alone does not
+    qualify; see :func:`rollout_fa4_available` for that case.
+    """
+    return actor_fa_available() and _cuda_supports_rollout_fa() and rollout_fa_available()
 
 
 def validate_attention_consistency(config: Any) -> None:

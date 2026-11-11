@@ -1,6 +1,6 @@
 # MiniMax H3 T2VA, FL2VA, and Ref2VA FlowGRPO
 
-Last updated: 10/29/2026
+Last updated: 11/11/2026
 
 These recipes train `MiniMaxAI/MiniMax-H3` LoRA adapters with FlowGRPO for
 text-to-audio-video (T2VA), first-frame image-to-audio-video (FL2VA), and
@@ -286,10 +286,76 @@ VAL_REF_IMAGE_SHORT_EDGE=768 \
 bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_ref2va_lora_v1.sh
 ```
 
-These recipes use the same GPU topology as their V0 counterparts. A
-`separate_async` MiniMax H3 recipe is not provided: it requires dedicated
-actor/rollout pools and checkpoint-engine synchronization rather than a
-mechanical V1 entrypoint switch.
+These recipes use the same GPU topology as their V0 counterparts. The only
+`separate_async` MiniMax H3 recipe is the T2VA launcher below, which pairs a
+Hopper Actor with an sm120 rollout.
+
+### Standalone rollout on sm120 GPUs (FlashAttention-4)
+
+`run_minimax_h3_t2va_lora_v1_separate_sm120.sh` runs T2VA with V1
+`separate_async`: the FSDP Actor (and the reward models) on Hopper GPUs, and the
+standalone vLLM-Omni rollout on sm120 Blackwell GPUs (RTX PRO Blackwell class),
+synchronized through the NCCL checkpoint engine.
+
+| Side | GPU | Attention |
+| --- | --- | --- |
+| Actor | Hopper | `_flash_3_varlen_hub` (kernels-hub FA3) |
+| Rollout | sm120 | `FLASH_ATTN`, resolved by vLLM-Omni to CuTe FA4 (`flash_attn.cute`) |
+
+Use `FLASH_ATTN` on sm120 rather than the alternatives:
+
+- `FLASH_ATTN_3_HUB` and vLLM's bundled FA3 have no sm120 kernels and fail at
+  launch with `no kernel image is available for execution on the device`.
+- `TORCH_SDPA` runs, but the H3 rollout pads its packed sequence and passes SDPA
+  a key-padding mask. PyTorch SDPA cannot use its flash kernel with an explicit
+  mask and falls back to the memory-efficient kernel, which is about 2x slower
+  per attention call on sm120. `FLASH_ATTN` consumes the packed `cu_seqlens`
+  and skips the padding instead. This only affects the rollout: the Diffusers
+  Actor runs the packed sequence without a mask, so `native` SDPA already uses
+  the flash kernel there.
+- On sm120 the FA4 kernels use the same `mma.sync` instructions as FA2, so
+  unmasked FA2, FA4 and SDPA-flash run at the same speed; the gain comes from
+  avoiding the masked SDPA path, not from a faster kernel.
+
+Install FA4 (a pure-Python CuTe DSL package; no compilation) on every rollout
+node and run the preflight there. It checks that vLLM-Omni's `FLASH_ATTN`
+resolves to `flash_attn.cute` and that FA4 matches SDPA forward and backward on
+H3 attention shapes:
+
+```bash
+pip install "flash-attn-4==4.0.0b38"
+python3 examples/flowgrpo_trainer/minimax_h3/check_sm120_flash_attn.py
+```
+
+verl-omni's resource pools do not pin nodes, so start the Ray cluster in an
+order that leaves the trainer pool only one choice: start the Ray head on the
+Hopper node with `--num-gpus=$TRAIN_GPUS`, launch the driver there, wait until
+the trainer pool has reserved every head GPU (for example, poll
+`ray.available_resources()["GPU"]` until it reaches 0), and only then join the
+sm120 node(s) with `--num-gpus=$ROLLOUT_GPUS_PER_NODE`. The standalone rollout
+pools can then only land on the sm120 nodes. Check the placement with
+`ray.util.placement_group_table()` once the `rollout_pool_*` groups exist.
+
+```bash
+# Hopper node (Ray head), after `ray start --head --num-gpus=4 ...`
+TRAIN_GPUS=4 ROLLOUT_NNODES=1 ROLLOUT_GPUS_PER_NODE=4 \
+MODEL_PATH="$MODEL_ROOT/FL2VA" \
+DATA_DIR="$HOME/data/vid_prompt/verl_omni" \
+IMAGEBIND_MODEL_PATH=/path/to/imagebind_huge.pth \
+bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora_v1_separate_sm120.sh
+```
+
+The launcher defaults to `ASYNC=1` (rollout overlaps training, samples at most
+one policy version stale) and `BYPASS=True`
+(`algorithm.rollout_correction.bypass_mode`, which reuses rollout log-probs
+instead of recomputing old log-probs). Set `ASYNC=0` for the on-policy
+`sync_compatible` schedule and `BYPASS=False` to recompute old log-probs.
+`separate_async` requires `TRAIN_BATCH_SIZE` to equal `parameter_sync_step *
+PPO_MINI_BATCH_SIZE`; the launcher derives `parameter_sync_step` from the two.
+
+Limitations of FA4 on sm120 (`flash-attn-4==4.0.0b38`): no deterministic
+backward and no FP8. FA4 is not wired as an Actor backend; for a colocated run
+on sm120 keep `native` with `TORCH_SDPA`.
 
 ### Ascend NPU
 

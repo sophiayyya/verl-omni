@@ -128,3 +128,41 @@ def test_resolve_smoke_attention_backends_prefers_local_fa(monkeypatch):
 def test_resolve_smoke_attention_backends_falls_back_without_fa3(monkeypatch):
     monkeypatch.setattr("tests.utils.smoke_attention.fa_available", lambda: False)
     assert resolve_smoke_attention_backends() == ("native", "TORCH_SDPA")
+
+
+def _patch_fa_env(monkeypatch, capability, modules):
+    import verl_omni.utils.diffusion_attention as da
+
+    monkeypatch.setattr(da, "_cuda_capability", lambda: capability)
+    monkeypatch.setattr(da, "_module_available", lambda name: name in modules)
+    return da
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (12, 0)])
+def test_blackwell_rollout_fa_requires_fa4(monkeypatch, capability):
+    da = _patch_fa_env(monkeypatch, capability, {"kernels", "flash_attn", "fa3_fwd_interface"})
+    assert not da.rollout_fa4_available()
+    assert not da.rollout_fa_available()
+
+    da = _patch_fa_env(monkeypatch, capability, {"kernels", "flash_attn.cute"})
+    assert da.rollout_fa4_available()
+    assert da.rollout_fa_available()
+    # The default FA3 kernels-hub Actor has no Blackwell kernels.
+    assert not da.fa_available()
+
+
+def test_hopper_rollout_fa_unchanged(monkeypatch):
+    da = _patch_fa_env(monkeypatch, (9, 0), {"kernels", "fa3_fwd_interface"})
+    assert da.rollout_fa_available()
+    assert not da.rollout_fa4_available()
+    assert da.fa_available()
+
+    da = _patch_fa_env(monkeypatch, (9, 0), {"kernels"})
+    assert not da.rollout_fa_available()
+    assert not da.fa_available()
+
+
+def test_rollout_fa_unavailable_without_cuda(monkeypatch):
+    da = _patch_fa_env(monkeypatch, None, {"kernels", "flash_attn.cute", "fa3_fwd_interface"})
+    assert not da.rollout_fa_available()
+    assert not da.fa_available()
